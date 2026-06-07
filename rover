@@ -1,0 +1,408 @@
+#include <WiFi.h>
+#include <SPI.h>
+#include <RF24.h>
+#include <nRF24L01.h>
+#include <ESP32Servo.h>
+#include <stdint.h>
+
+// =====================================================
+// ================= NRF24 CONFIG ======================
+// =====================================================
+
+RF24 radio(4, 5); // CE, CSN
+
+const byte addrRX[6] = "00001";
+const byte addrTX[6] = "00002";
+
+// =====================================================
+// ================= PIN DEFINITIONS ===================
+// =====================================================
+
+// LEFT BTS7960
+#define LEFT_RPWM   25
+#define LEFT_LPWM   26
+
+// RIGHT BTS7960
+#define RIGHT_RPWM  27
+#define RIGHT_LPWM  14
+
+// ENABLE PINS
+#define MOTOR_REN   32
+#define MOTOR_LEN   33
+
+// ULTRASONIC
+#define TRIG_PIN    21
+#define ECHO_PIN    22
+
+// BUZZER
+#define BUZZER_PIN  2
+
+// SERVOS
+#define PAN_SERVO_PIN   13
+#define TILT_SERVO_PIN  12
+
+// =====================================================
+// ================= PWM CONFIG ========================
+// =====================================================
+
+#define PWM_FREQ 1000
+#define PWM_RES 8
+
+// MOTOR PWM CHANNELS
+#define CH_LEFT_R   2
+#define CH_LEFT_L   3
+#define CH_RIGHT_R  6
+#define CH_RIGHT_L  7
+
+// =====================================================
+// ================= DATA STRUCTURES ===================
+// =====================================================
+
+struct ControlData {
+
+  int16_t joy1X;
+  int16_t joy1Y;
+
+  int16_t joy2X;
+  int16_t joy2Y;
+
+  bool sw1;
+  bool sw2;
+
+  int16_t key;
+};
+
+struct Telemetry {
+
+  bool obstacle;
+};
+
+// =====================================================
+// ================= GLOBAL VARIABLES ==================
+// =====================================================
+
+ControlData data;
+Telemetry txData;
+
+Servo panServo;
+Servo tiltServo;
+
+long duration;
+int distanceCM;
+
+unsigned long lastReceiveTime = 0;
+String moveCommand = "STOP";
+
+// =====================================================
+// ================= FUNCTION DEFINITIONS ==============
+// =====================================================
+
+void stopMotors() {
+
+  ledcWrite(CH_LEFT_R, 0);
+  ledcWrite(CH_LEFT_L, 0);
+
+  ledcWrite(CH_RIGHT_R, 0);
+  ledcWrite(CH_RIGHT_L, 0);
+}
+
+// =====================================================
+
+void setMotor(int leftSpeed, int rightSpeed) {
+
+  // LEFT MOTOR
+  if (leftSpeed > 0) {
+
+    ledcWrite(CH_LEFT_R, leftSpeed);
+    ledcWrite(CH_LEFT_L, 0);
+
+  } else {
+
+    ledcWrite(CH_LEFT_R, 0);
+    ledcWrite(CH_LEFT_L, abs(leftSpeed));
+  }
+
+  // RIGHT MOTOR
+  if (rightSpeed > 0) {
+
+    ledcWrite(CH_RIGHT_R, rightSpeed);
+    ledcWrite(CH_RIGHT_L, 0);
+
+  } else {
+
+    ledcWrite(CH_RIGHT_R, 0);
+    ledcWrite(CH_RIGHT_L, abs(rightSpeed));
+  }
+
+  // =========================
+  // MOVE COMMAND DETECTION
+  // =========================
+
+  if(leftSpeed > 0 && rightSpeed > 0)
+      moveCommand = "FORWARD";
+
+  else if(leftSpeed < 0 && rightSpeed < 0)
+      moveCommand = "BACKWARD";
+
+  else if(leftSpeed > rightSpeed)
+      moveCommand = "LEFT";
+
+  else if(rightSpeed > leftSpeed)
+      moveCommand = "RIGHT";
+
+  else
+      moveCommand = "STOP";
+}
+
+
+// =====================================================
+
+void handleMovement() {
+
+  int forward = map(data.joy1X, 0, 1023, -255, 255);
+  int turn = map(data.joy1Y, 0, 1023, 255, -255);
+
+  // DEADZONE
+  if (abs(forward) < 20)
+    forward = 0;
+
+  if (abs(turn) < 20)
+    turn = 0;
+
+  // MIXING
+  int leftMotor = forward + turn;
+  int rightMotor = forward - turn;
+
+  // LIMIT
+  leftMotor = constrain(leftMotor, -255, 255);
+  // Serial.println(leftMotor);
+  rightMotor = constrain(rightMotor, -255, 255);
+  // Serial.println(rightMotor);
+  setMotor(leftMotor, rightMotor);
+}
+
+// =====================================================
+
+void handleCamera() {
+
+  static float currentPan = 90;
+  static float currentTilt = 90;
+
+  int joyX = data.joy2X;
+  int joyY = data.joy2Y;
+
+  // DEADZONE
+  if (joyX > 480 && joyX < 540)
+    joyX = 512;
+
+  if (joyY > 480 && joyY < 540)
+    joyY = 512;
+
+  // MAP
+  int targetPan = map(joyX, 0, 1023, 180, 0);
+  int targetTilt = map(joyY, 0, 1023, 180, 0);
+
+  // SMOOTH MOVEMENT
+  currentPan += (targetPan - currentPan) * 0.05;
+  currentTilt += (targetTilt - currentTilt) * 0.05;
+
+  // LIMITS
+  currentPan = constrain(currentPan, 0, 180);
+  currentTilt = constrain(currentTilt, 0, 180);
+
+  // MOVE SERVOS
+  panServo.write((int)currentPan);
+  tiltServo.write((int)currentTilt);
+
+  // DEBUG
+  // Serial.print("J2X: ");
+  // Serial.print(joyX);
+
+  // Serial.print(" | J2Y: ");
+  // Serial.print(joyY);
+
+  // Serial.print(" | PAN: ");
+  // Serial.print((int)currentPan);
+
+  // Serial.print(" | TILT: ");
+  // Serial.println((int)currentTilt);
+}
+
+// =====================================================
+
+int getDistance() {
+
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG_PIN, LOW);
+
+  duration = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  int distance = duration * 0.034 / 2;
+  // Serial.println(distance);
+
+  return distance;
+}
+
+// =====================================================
+// ================= SETUP =============================
+// =====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  // TURN OFF WIFI
+  WiFi.mode(WIFI_OFF);
+
+  // ENABLE PINS
+  pinMode(MOTOR_REN, OUTPUT);
+  pinMode(MOTOR_LEN, OUTPUT);
+
+  digitalWrite(MOTOR_REN, HIGH);
+  digitalWrite(MOTOR_LEN, HIGH);
+
+  // =================================================
+  // PWM CHANNEL SETUP
+  // =================================================
+
+  ledcSetup(CH_LEFT_R, PWM_FREQ, PWM_RES);
+  ledcSetup(CH_LEFT_L, PWM_FREQ, PWM_RES);
+
+  ledcSetup(CH_RIGHT_R, PWM_FREQ, PWM_RES);
+  ledcSetup(CH_RIGHT_L, PWM_FREQ, PWM_RES);
+
+  // =================================================
+  // ATTACH PWM PINS
+  // =================================================
+
+  ledcAttachPin(LEFT_RPWM, CH_LEFT_R);
+  ledcAttachPin(LEFT_LPWM, CH_LEFT_L);
+
+  ledcAttachPin(RIGHT_RPWM, CH_RIGHT_R);
+  ledcAttachPin(RIGHT_LPWM, CH_RIGHT_L);
+
+  stopMotors();
+
+  // ULTRASONIC
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  // BUZZER
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  // SERVOS
+  panServo.attach(PAN_SERVO_PIN);
+  tiltServo.attach(TILT_SERVO_PIN);
+
+  panServo.write(90);
+  tiltServo.write(90);
+
+  // SPI
+  SPI.begin();
+
+  // NRF24
+  if (!radio.begin()) {
+
+    Serial.println("NRF NOT DETECTED");
+
+    while (1);
+  }
+
+  Serial.println("NRF CONNECTED");
+
+  radio.openReadingPipe(1, addrRX);
+  radio.openWritingPipe(addrTX);
+
+  radio.setPALevel(RF24_PA_MIN);
+  radio.setDataRate(RF24_250KBPS);
+  radio.setChannel(108);
+
+  radio.startListening();
+
+  Serial.println("ROVER READY");
+}
+
+// =====================================================
+// ================= LOOP ==============================
+// =====================================================
+
+void loop() {
+
+  // RECEIVE DATA
+  if (radio.available()) {
+
+    radio.read(&data, sizeof(data));
+
+    lastReceiveTime = millis();
+
+    // AUTH CHECK
+    if (data.key == 1972) {
+
+      Serial.print("J1X: ");
+      Serial.print(data.joy1X);
+
+      Serial.print(" | J1Y: ");
+      Serial.print(data.joy1Y);
+
+      Serial.print(" | J2X: ");
+      Serial.print(data.joy2X);
+
+      Serial.print(" | J2Y: ");
+      Serial.println(data.joy2Y);
+
+      // MOVEMENT
+    
+      handleMovement();
+
+      // CAMERA
+      handleCamera();
+
+     // BUZZER
+      digitalWrite(BUZZER_PIN,data.sw1);
+
+      // CAMERA RESET
+      if (data.sw2) {
+
+        panServo.write(90);
+        tiltServo.write(90);
+      }
+    }
+  }
+
+  // FAILSAFE
+  if (millis() - lastReceiveTime > 500) {
+
+    stopMotors();
+  }
+
+  // OBSTACLE DETECTION
+  distanceCM = getDistance();
+  // Serial.println(distanceCM);
+
+  if (distanceCM > 0 && distanceCM < 35) {
+
+    if (moveCommand == "FORWARD") stopMotors();
+    else handleMovement();
+
+    Serial.println("OBSTACLE DETECTED");
+  }
+
+  // =================================================
+  // ================= TELEMETRY =====================
+  // =================================================
+
+  txData.obstacle = (distanceCM < 35);
+
+  radio.stopListening();
+
+  radio.write(&txData, sizeof(txData));
+
+  radio.startListening();
+
+  delay(20);
+}
